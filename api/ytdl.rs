@@ -8,6 +8,7 @@ use vercel_runtime::{run, service_fn, Error, Request, Response};
 
 const LOCK_TTL_SECONDS: u64 = 5 * 60;
 const CACHE_TTL_SECONDS: u64 = 30 * 24 * 60 * 60;
+const MAX_DOWNLOAD_BYTES: usize = 30 * 1024 * 1024;
 
 #[derive(Deserialize, Serialize, Clone)]
 struct BlobPutResponse {
@@ -154,11 +155,18 @@ async fn release_lock(video_id: &str) -> Result<(), Error> {
     Ok(())
 }
 
-async fn collect_stream_bytes(video: &Video) -> Result<Vec<u8>, rusty_ytdl::VideoError> {
+async fn collect_stream_bytes(video: &Video) -> Result<Vec<u8>, Error> {
     let stream = video.stream().await?;
-    let mut body = Vec::with_capacity(stream.content_length());
+    let mut body = Vec::with_capacity(stream.content_length().min(MAX_DOWNLOAD_BYTES));
 
     while let Some(chunk) = stream.chunk().await? {
+        if body.len() + chunk.len() > MAX_DOWNLOAD_BYTES {
+            return Err(format!(
+                "Audio stream exceeds {} MB function limit",
+                MAX_DOWNLOAD_BYTES / 1024 / 1024
+            )
+            .into());
+        }
         body.extend_from_slice(&chunk);
     }
 
@@ -193,8 +201,16 @@ async fn upload_to_blob(
         .headers(headers)
         .body(body)
         .send()
-        .await?
-        .error_for_status()?;
+        .await?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let details = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "Unable to read blob API response body".to_string());
+        return Err(format!("Blob API request failed ({status}): {details}").into());
+    }
 
     Ok(response.json::<BlobPutResponse>().await?)
 }
@@ -331,6 +347,26 @@ async fn handler(req: Request) -> Result<Response<Value>, Error> {
                 )
             }
         };
+
+        if let Some(content_length) = selected_format.content_length.as_deref() {
+            if let Ok(content_length) = content_length.parse::<u64>() {
+                if content_length > MAX_DOWNLOAD_BYTES as u64 {
+                    return json_response(
+                        413,
+                        json!({
+                            "error": "Audio stream too large for Vercel function",
+                            "message": format!(
+                                "Selected stream is {} MB; function limit is {} MB",
+                                content_length / 1024 / 1024,
+                                MAX_DOWNLOAD_BYTES / 1024 / 1024,
+                            ),
+                            "videoId": video_id,
+                            "videoUrl": video_url,
+                        }),
+                    );
+                }
+            }
+        }
 
         let content_type = format!(
             "{}/{}",
