@@ -99,6 +99,18 @@ fn lock_key(video_id: &str) -> String {
     format!("music:ytdl:video:lock:{video_id}")
 }
 
+fn request_id(req: &Request) -> String {
+    req.headers()
+        .get("x-vercel-id")
+        .and_then(|value| value.to_str().ok())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| "unknown-request-id".to_string())
+}
+
+fn log_failure(request_id: &str, stage: &str, video_id: &str, error: &str) {
+    eprintln!("[ytdl][{request_id}] {stage} failed for {video_id}: {error}");
+}
+
 async fn get_redis_connection() -> Result<Option<redis::aio::MultiplexedConnection>, Error> {
     let redis_url = match std::env::var("REDIS_URL") {
         Ok(value) if !value.trim().is_empty() => value,
@@ -225,6 +237,7 @@ async fn handler(req: Request) -> Result<Response<Value>, Error> {
     if req.method().as_str() != "GET" {
         return json_response(405, json!({ "error": "Method not allowed" }));
     }
+    let request_id = request_id(&req);
 
     let configured_secret = match std::env::var("YTDL_SECRET") {
         Ok(value) if !value.trim().is_empty() => value,
@@ -321,13 +334,15 @@ async fn handler(req: Request) -> Result<Response<Value>, Error> {
         let info = match video.get_info().await {
             Ok(info) => info,
             Err(error) => {
+                log_failure(&request_id, "youtube_lookup", &video_id, &error.to_string());
                 return json_response(
-                    502,
+                    503,
                     json!({
                         "error": "rusty_ytdl lookup failed",
                         "message": error.to_string(),
                         "videoId": video_id,
                         "videoUrl": video_url,
+                        "requestId": request_id,
                     }),
                 )
             }
@@ -336,13 +351,15 @@ async fn handler(req: Request) -> Result<Response<Value>, Error> {
         let selected_format = match choose_format(&info.formats, &video_options) {
             Ok(format) => format,
             Err(error) => {
+                log_failure(&request_id, "format_selection", &video_id, &error.to_string());
                 return json_response(
-                    502,
+                    422,
                     json!({
                         "error": "No downloadable format found",
                         "message": error.to_string(),
                         "videoId": video_id,
                         "videoUrl": video_url,
+                        "requestId": request_id,
                     }),
                 )
             }
@@ -379,13 +396,15 @@ async fn handler(req: Request) -> Result<Response<Value>, Error> {
         let body = match collect_stream_bytes(&video).await {
             Ok(body) => body,
             Err(error) => {
+                log_failure(&request_id, "stream_download", &video_id, &error.to_string());
                 return json_response(
-                    502,
+                    503,
                     json!({
                         "error": "rusty_ytdl download failed",
                         "message": error.to_string(),
                         "videoId": video_id,
                         "videoUrl": video_url,
+                        "requestId": request_id,
                     }),
                 )
             }
@@ -394,14 +413,16 @@ async fn handler(req: Request) -> Result<Response<Value>, Error> {
         let blob = match upload_to_blob(&blob_path, &content_type, body).await {
             Ok(blob) => blob,
             Err(error) => {
+                log_failure(&request_id, "blob_upload", &video_id, &error.to_string());
                 return json_response(
-                    502,
+                    503,
                     json!({
                         "error": "Blob upload failed",
                         "message": error.to_string(),
                         "videoId": video_id,
                         "videoUrl": video_url,
                         "pathname": blob_path,
+                        "requestId": request_id,
                     }),
                 )
             }
