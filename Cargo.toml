@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 redis = { version = "0.28", features = ["tokio-comp", "tokio-rustls-comp"] }
 reqwest = { version = "0.12", features = ["json"] }
-rusty_ytdl = "0.7.4"
+rusty_ytdl = { git = "https://github.com/Mithronn/rusty_ytdl", rev = "af7e85e0e6618ccd3d6081fbae18c757a8ec82ad" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokio = { version = "1", features = ["full"] }

@@ -1,10 +1,10 @@
 use redis::{AsyncCommands, Client as RedisClient};
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
-use rusty_ytdl::{choose_format, Video, VideoOptions};
+use rusty_ytdl::{RequestOptions, Video, VideoOptions, choose_format};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use url::form_urlencoded;
-use vercel_runtime::{run, service_fn, Error, Request, Response};
+use vercel_runtime::{Error, Request, Response, run, service_fn};
 
 const LOCK_TTL_SECONDS: u64 = 5 * 60;
 const CACHE_TTL_SECONDS: u64 = 30 * 24 * 60 * 60;
@@ -87,6 +87,27 @@ fn extract_input(req: &Request) -> String {
     String::new()
 }
 
+fn env_optional(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn build_video_options() -> VideoOptions {
+    let po_token = env_optional("YTDL_PO_TOKEN");
+    let cookies = env_optional("YTDL_COOKIES");
+
+    VideoOptions {
+        request_options: RequestOptions {
+            po_token,
+            cookies,
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
 fn make_blob_path(video_id: &str, extension: &str) -> String {
     format!("audio/{video_id}.{extension}")
 }
@@ -111,6 +132,16 @@ fn log_failure(request_id: &str, stage: &str, video_id: &str, error: &str) {
     eprintln!("[ytdl][{request_id}] {stage} failed for {video_id}: {error}");
 }
 
+async fn video_looks_public(video_id: &str) -> bool {
+    let url = format!(
+        "https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v={video_id}&format=json"
+    );
+
+    match reqwest::Client::new().get(url).send().await {
+        Ok(response) => response.status().is_success(),
+        Err(_) => false,
+    }
+}
 async fn get_redis_connection() -> Result<Option<redis::aio::MultiplexedConnection>, Error> {
     let redis_url = match std::env::var("REDIS_URL") {
         Ok(value) if !value.trim().is_empty() => value,
@@ -167,7 +198,7 @@ async fn release_lock(video_id: &str) -> Result<(), Error> {
     Ok(())
 }
 
-async fn collect_stream_bytes(video: &Video) -> Result<Vec<u8>, Error> {
+async fn collect_stream_bytes(video: &Video<'_>) -> Result<Vec<u8>, Error> {
     let stream = video.stream().await?;
     let mut body = Vec::with_capacity(stream.content_length().min(MAX_DOWNLOAD_BYTES));
 
@@ -190,7 +221,8 @@ async fn upload_to_blob(
     content_type: &str,
     body: Vec<u8>,
 ) -> Result<BlobPutResponse, Error> {
-    let token = std::env::var("BLOB_READ_WRITE_TOKEN").map_err(|_| "BLOB_READ_WRITE_TOKEN missing")?;
+    let token =
+        std::env::var("BLOB_READ_WRITE_TOKEN").map_err(|_| "BLOB_READ_WRITE_TOKEN missing")?;
 
     let url = format!(
         "https://vercel.com/api/blob/?pathname={}",
@@ -208,12 +240,7 @@ async fn upload_to_blob(
     headers.insert("x-content-type", HeaderValue::from_str(content_type)?);
 
     let client = reqwest::Client::new();
-    let response = client
-        .put(url)
-        .headers(headers)
-        .body(body)
-        .send()
-        .await?;
+    let response = client.put(url).headers(headers).body(body).send().await?;
 
     if !response.status().is_success() {
         let status = response.status();
@@ -258,7 +285,7 @@ async fn handler(req: Request) -> Result<Response<Value>, Error> {
         );
     }
 
-    let video_options = VideoOptions::default();
+    let video_options = build_video_options();
 
     let video = match Video::new_with_options(input.clone(), video_options.clone()) {
         Ok(video) => video,
@@ -269,7 +296,7 @@ async fn handler(req: Request) -> Result<Response<Value>, Error> {
                     "error": "Invalid YouTube input",
                     "message": error.to_string(),
                 }),
-            )
+            );
         }
     };
 
@@ -335,11 +362,17 @@ async fn handler(req: Request) -> Result<Response<Value>, Error> {
             Ok(info) => info,
             Err(error) => {
                 log_failure(&request_id, "youtube_lookup", &video_id, &error.to_string());
+                let error_text = error.to_string();
+                let mut message = error_text.clone();
+                if error_text.contains("Video is private") && video_looks_public(&video_id).await {
+                    message = "rusty_ytdl reported `Video is private`, but YouTube oEmbed reports this video as public; this is usually a YouTube anti-bot/client-signature false positive. Retry later, rotate egress IP/proxy, or provide cookies in `VideoOptions.request_options.cookies`.".to_string();
+                }
                 return json_response(
                     503,
                     json!({
                         "error": "rusty_ytdl lookup failed",
-                        "message": error.to_string(),
+                        "message": message,
+                        "rawMessage": error_text,
                         "videoId": video_id,
                         "videoUrl": video_url,
                         "requestId": request_id,
@@ -379,6 +412,7 @@ async fn handler(req: Request) -> Result<Response<Value>, Error> {
                             ),
                             "videoId": video_id,
                             "videoUrl": video_url,
+                            "requestId": request_id,
                         }),
                     );
                 }
