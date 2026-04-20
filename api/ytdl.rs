@@ -142,7 +142,6 @@ async fn video_looks_public(video_id: &str) -> bool {
         Err(_) => false,
     }
 }
-
 async fn get_redis_connection() -> Result<Option<redis::aio::MultiplexedConnection>, Error> {
     let redis_url = match std::env::var("REDIS_URL") {
         Ok(value) if !value.trim().is_empty() => value,
