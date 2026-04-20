@@ -1,0 +1,6 @@
+target
+.venv
+.vercel
+__pycache__
+tests
+__tests__
