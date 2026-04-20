@@ -21,3 +21,4 @@ Returns JSON with the uploaded Blob URL plus basic metadata.
 
 - `api/ytdl.py` runs on Vercel Python
 - Downloading is handled by `yt-dlp`
+- Dependencies are managed with `uv` via `pyproject.toml` and `uv.lock`
