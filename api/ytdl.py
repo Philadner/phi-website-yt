@@ -167,6 +167,32 @@ def find_downloaded_file(temp_dir: str, video_id: str) -> Optional[str]:
     return matches[0]
 
 
+def is_truthy(value: str) -> bool:
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def build_extractor_args() -> dict:
+    extractor_args = {
+        "youtube": {
+            "player_client": ["default", "mweb"],
+            "fetch_pot": ["auto"],
+        }
+    }
+
+    if is_truthy(os.getenv("YTDL_POT_TRACE", "")):
+        extractor_args["youtube"]["pot_trace"] = ["true"]
+
+    provider_url = os.getenv("YTDL_POT_PROVIDER_URL", "").strip()
+    if provider_url:
+        extractor_args["youtubepot-bgutilhttp"] = {"base_url": [provider_url]}
+
+    provider_server_home = os.getenv("YTDL_POT_PROVIDER_SERVER_HOME", "").strip()
+    if provider_server_home:
+        extractor_args["youtubepot-bgutilscript"] = {"server_home": [provider_server_home]}
+
+    return extractor_args
+
+
 def build_ydl_opts(temp_dir: str):
     return {
         "quiet": True,
@@ -178,6 +204,7 @@ def build_ydl_opts(temp_dir: str):
         "nopart": True,
         "retries": 1,
         "extractor_retries": 1,
+        "extractor_args": build_extractor_args(),
     }
 
 
