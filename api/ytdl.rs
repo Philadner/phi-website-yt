@@ -413,6 +413,7 @@ async fn handler(req: Request) -> Result<Response<Value>, Error> {
                             ),
                             "videoId": video_id,
                             "videoUrl": video_url,
+                            "requestId": request_id,
                         }),
                     );
                 }
