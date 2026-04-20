@@ -7,6 +7,7 @@ Standalone Vercel Python service for YouTube audio download/upload.
 - `YTDL_SECRET`
 - `BLOB_READ_WRITE_TOKEN`
 - `REDIS_URL`
+- `CRON_SECRET` (recommended; Vercel will send it as a Bearer token for cron requests)
 - `YTDL_POT_PROVIDER_URL` (optional; external bgutil provider base URL such as `http://your-provider:4416`)
 - `YTDL_POT_PROVIDER_SERVER_HOME` (optional; local bgutil server path for script mode)
 - `YTDL_POT_TRACE` (optional; set to `true` for yt-dlp PO-token debug logging)
@@ -32,3 +33,4 @@ Returns JSON with the uploaded Blob URL plus basic metadata.
 - The app is configured for `yt-dlp`'s `mweb` client with PO-token auto-fetch enabled
 - The repo installs `bgutil-ytdlp-pot-provider`
 - On Vercel, the recommended setup is to run the bgutil provider as a separate HTTP service and set `YTDL_POT_PROVIDER_URL`
+- `GET /api/pot-provider-ping` pings the provider's `/ping` endpoint so Vercel Cron can keep it warm

@@ -1,5 +1,11 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
+  "crons": [
+    {
+      "path": "/api/pot-provider-ping",
+      "schedule": "*/5 * * * *"
+    }
+  ],
   "functions": {
     "api/**/*.py": {
       "excludeFiles": "{target/**,.venv/**,.vercel/**,__pycache__/**,**/__pycache__/**,tests/**,__tests__/**,**/*.test.py,**/test_*.py}"
