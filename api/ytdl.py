@@ -92,8 +92,29 @@ def request_id() -> str:
     return request.headers.get("x-vercel-id", "unknown-request-id")
 
 
-def log_failure(stage: str, video_id: str, error: str) -> None:
-    print(f"[ytdl][{request_id()}] {stage} failed for {video_id}: {error}", flush=True)
+def log_event(stage: str, **fields) -> None:
+    safe_fields = {
+        key: value
+        for key, value in fields.items()
+        if value is not None and key not in {"secret", "cookie", "cookies", "authorization"}
+    }
+    print(
+        json.dumps(
+            {
+                "service": "ytdl",
+                "stage": stage,
+                "requestId": request_id(),
+                **safe_fields,
+            },
+            default=str,
+            sort_keys=True,
+        ),
+        flush=True,
+    )
+
+
+def log_failure(stage: str, video_id: str, error: str, **fields) -> None:
+    log_event(stage, ok=False, videoId=video_id, error=error, **fields)
 
 
 def cookie_config_source() -> Optional[str]:
@@ -353,18 +374,43 @@ def extract_audio_from_video(input_path: str) -> str:
     return mp3_path
 
 
-def debug_payload():
+def debug_payload(input_value: Optional[str] = None):
+    payload = {
+        "ok": True,
+        "hasCookieConfig": cookie_config_source() is not None,
+        "cookieSource": cookie_config_source(),
+        "hasPotProviderUrl": bool(os.getenv("YTDL_POT_PROVIDER_URL", "").strip()),
+        "hasPotProviderServerHome": bool(os.getenv("YTDL_POT_PROVIDER_SERVER_HOME", "").strip()),
+        "hasFfmpeg": get_ffmpeg_binary() is not None,
+        "potTrace": is_truthy(os.getenv("YTDL_POT_TRACE", "")),
+    }
+
+    if input_value:
+        try:
+            with YoutubeDL(build_ydl_opts(tempfile.gettempdir(), format_selector="all")) as probe:
+                info = probe.extract_info(input_value, download=False)
+            formats = format_summary(info)
+            payload["probe"] = {
+                "ok": True,
+                "videoId": extract_video_id(input_value, info),
+                "videoUrl": info.get("webpage_url") or info.get("original_url") or input_value,
+                "title": info.get("title"),
+                "formats": formats,
+                "selectedFormat": audio_format_selector(formats)
+                if formats["audioOnly"] > 0 or formats["muxed"] > 0
+                else None,
+                "willExtractAudio": formats["audioOnly"] == 0 and formats["muxed"] > 0,
+            }
+        except DownloadError as error:
+            payload["probe"] = {
+                "ok": False,
+                "error": "Probe failed",
+                "message": str(error),
+            }
+
     return json_response(
         200,
-        {
-            "ok": True,
-            "hasCookieConfig": cookie_config_source() is not None,
-            "cookieSource": cookie_config_source(),
-            "hasPotProviderUrl": bool(os.getenv("YTDL_POT_PROVIDER_URL", "").strip()),
-            "hasPotProviderServerHome": bool(os.getenv("YTDL_POT_PROVIDER_SERVER_HOME", "").strip()),
-            "hasFfmpeg": get_ffmpeg_binary() is not None,
-            "potTrace": is_truthy(os.getenv("YTDL_POT_TRACE", "")),
-        },
+        payload,
     )
 
 
@@ -382,7 +428,7 @@ def handler():
         return json_response(401, {"error": "Unauthorised"})
 
     if is_truthy(query_value("debug") or ""):
-        return debug_payload()
+        return debug_payload(extract_input())
 
     input_value = extract_input()
     if not input_value:
@@ -395,18 +441,33 @@ def handler():
         with YoutubeDL(build_ydl_opts(tempfile.gettempdir(), format_selector="all")) as probe:
             info = probe.extract_info(input_value, download=False)
     except DownloadError as error:
+        log_failure("probe", "unknown", str(error), input=input_value)
         return json_response(
             400,
             {
                 "error": "Invalid YouTube input",
                 "message": str(error),
+                "requestId": request_id(),
             },
         )
 
     video_id = extract_video_id(input_value, info)
     video_url = info.get("webpage_url") or info.get("original_url") or input_value
     formats = format_summary(info)
+    selected_format = audio_format_selector(formats) if formats["audioOnly"] > 0 or formats["muxed"] > 0 else None
+    log_event(
+        "probe",
+        ok=True,
+        videoId=video_id,
+        title=info.get("title"),
+        formats=formats,
+        selectedFormat=selected_format,
+        willExtractAudio=formats["audioOnly"] == 0 and formats["muxed"] > 0,
+        cookieSource=cookie_config_source(),
+        hasFfmpeg=get_ffmpeg_binary() is not None,
+    )
     if formats["audioOnly"] == 0 and formats["muxed"] == 0:
+        log_failure("format_selection", video_id, "no playable formats", formats=formats)
         return json_response(
             422,
             {
@@ -489,10 +550,17 @@ def handler():
 
         with tempfile.TemporaryDirectory() as temp_dir:
             try:
-                with YoutubeDL(build_ydl_opts(temp_dir, format_selector=audio_format_selector(formats))) as ydl:
+                with YoutubeDL(build_ydl_opts(temp_dir, format_selector=selected_format)) as ydl:
                     ydl.download([input_value])
             except DownloadError as error:
-                log_failure("stream_download", video_id, str(error))
+                log_failure(
+                    "stream_download",
+                    video_id,
+                    str(error),
+                    formats=formats,
+                    selectedFormat=selected_format,
+                    willExtractAudio=not has_audio_only_format(formats),
+                )
                 return json_response(
                     503,
                     {
@@ -507,7 +575,13 @@ def handler():
 
             downloaded_path = find_downloaded_file(temp_dir, video_id)
             if not downloaded_path:
-                log_failure("stream_download", video_id, "downloaded file not found")
+                log_failure(
+                    "stream_download",
+                    video_id,
+                    "downloaded file not found",
+                    formats=formats,
+                    selectedFormat=selected_format,
+                )
                 return json_response(
                     503,
                     {
@@ -521,9 +595,21 @@ def handler():
 
             if not has_audio_only_format(formats):
                 try:
+                    log_event(
+                        "audio_extract_start",
+                        ok=True,
+                        videoId=video_id,
+                        sourceExtension=os.path.splitext(downloaded_path)[1],
+                    )
                     downloaded_path = extract_audio_from_video(downloaded_path)
                 except Exception as error:
-                    log_failure("audio_extract", video_id, str(error))
+                    log_failure(
+                        "audio_extract",
+                        video_id,
+                        str(error),
+                        hasFfmpeg=get_ffmpeg_binary() is not None,
+                        formats=formats,
+                    )
                     return json_response(
                         503,
                         {
@@ -538,6 +624,14 @@ def handler():
 
             body_size = os.path.getsize(downloaded_path)
             if body_size > MAX_DOWNLOAD_BYTES:
+                log_failure(
+                    "size_check",
+                    video_id,
+                    "audio stream too large",
+                    bodySize=body_size,
+                    limit=MAX_DOWNLOAD_BYTES,
+                    extension=os.path.splitext(downloaded_path)[1].lstrip(".") or "bin",
+                )
                 return json_response(
                     413,
                     {
@@ -568,7 +662,7 @@ def handler():
         try:
             blob = upload_to_blob(blob_path, content_type, body)
         except Exception as error:
-            log_failure("blob_upload", video_id, str(error))
+            log_failure("blob_upload", video_id, str(error), pathname=blob_path, contentType=content_type)
             return json_response(
                 503,
                 {
@@ -589,6 +683,15 @@ def handler():
             "cached_at": str(int(time.time())),
         }
         set_cached_playback(video_id, cached)
+        log_event(
+            "complete",
+            ok=True,
+            videoId=video_id,
+            source="download",
+            pathname=blob.get("pathname"),
+            contentType=blob.get("contentType") or content_type,
+            bodySize=len(body),
+        )
 
         return json_response(
             200,
