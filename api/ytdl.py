@@ -283,6 +283,7 @@ def normalise_cookie_contents(cookie_contents: str) -> str:
 
 
 def build_ydl_opts(temp_dir: str, *, format_selector: Optional[str] = None, log_stage: str = "yt_dlp"):
+    js_runtimes = discover_js_runtimes()
     opts = {
         "quiet": True,
         "no_warnings": False,
@@ -295,6 +296,9 @@ def build_ydl_opts(temp_dir: str, *, format_selector: Optional[str] = None, log_
         "extractor_retries": 1,
         "extractor_args": build_extractor_args(),
     }
+
+    if js_runtimes:
+        opts["js_runtimes"] = js_runtimes
 
     if format_selector:
         opts["format"] = format_selector
@@ -353,6 +357,36 @@ def get_ffmpeg_binary() -> Optional[str]:
     if configured:
         return configured
     return shutil.which("ffmpeg")
+
+
+def discover_js_runtimes() -> dict:
+    configured = os.getenv("YTDL_JS_RUNTIME", "").strip()
+    if configured:
+        if ":" in configured:
+            name, path = configured.split(":", 1)
+            return {name.strip(): {"path": path.strip()}}
+        return {configured: {}}
+
+    for name in ("deno", "node", "bun", "quickjs"):
+        path = shutil.which(name)
+        if path:
+            return {name: {"path": path}}
+
+    return {}
+
+
+def js_runtime_summary(runtimes: Optional[dict] = None) -> dict:
+    values = runtimes if runtimes is not None else discover_js_runtimes()
+    return {
+        "configured": bool(os.getenv("YTDL_JS_RUNTIME", "").strip()),
+        "selected": list(values.keys()),
+        "available": {
+            "deno": shutil.which("deno") is not None,
+            "node": shutil.which("node") is not None,
+            "bun": shutil.which("bun") is not None,
+            "quickjs": shutil.which("quickjs") is not None,
+        },
+    }
 
 
 def pot_provider_status() -> Optional[dict]:
@@ -416,6 +450,7 @@ def debug_payload(input_value: Optional[str] = None):
         "hasPotProviderServerHome": bool(os.getenv("YTDL_POT_PROVIDER_SERVER_HOME", "").strip()),
         "potProvider": pot_provider_status(),
         "hasFfmpeg": get_ffmpeg_binary() is not None,
+        "jsRuntime": js_runtime_summary(),
         "potTrace": is_truthy(os.getenv("YTDL_POT_TRACE", "")),
     }
 
@@ -502,6 +537,7 @@ def handler():
         cookieSource=cookie_config_source(),
         hasFfmpeg=get_ffmpeg_binary() is not None,
         potProvider=pot_provider_status(),
+        jsRuntime=js_runtime_summary(),
     )
     if formats["audioOnly"] == 0 and formats["muxed"] == 0:
         log_failure("format_selection", video_id, "no playable formats", formats=formats)
