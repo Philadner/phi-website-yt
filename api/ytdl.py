@@ -117,6 +117,20 @@ def log_failure(stage: str, video_id: str, error: str, **fields) -> None:
     log_event(stage, ok=False, videoId=video_id, error=error, **fields)
 
 
+class YtdlLogger:
+    def __init__(self, stage: str):
+        self.stage = stage
+
+    def debug(self, message: str) -> None:
+        return
+
+    def warning(self, message: str) -> None:
+        log_event("yt_dlp_warning", ok=False, ytdlStage=self.stage, message=message)
+
+    def error(self, message: str) -> None:
+        log_event("yt_dlp_error", ok=False, ytdlStage=self.stage, message=message)
+
+
 def cookie_config_source() -> Optional[str]:
     if os.getenv("YTDL_COOKIE_FILE", "").strip():
         return "file"
@@ -268,10 +282,11 @@ def normalise_cookie_contents(cookie_contents: str) -> str:
     return "\n".join(lines)
 
 
-def build_ydl_opts(temp_dir: str, *, format_selector: Optional[str] = None):
+def build_ydl_opts(temp_dir: str, *, format_selector: Optional[str] = None, log_stage: str = "yt_dlp"):
     opts = {
         "quiet": True,
-        "no_warnings": True,
+        "no_warnings": False,
+        "logger": YtdlLogger(log_stage),
         "noplaylist": True,
         "outtmpl": os.path.join(temp_dir, "%(id)s.%(ext)s"),
         "cachedir": False,
@@ -340,6 +355,24 @@ def get_ffmpeg_binary() -> Optional[str]:
     return shutil.which("ffmpeg")
 
 
+def pot_provider_status() -> Optional[dict]:
+    provider_url = os.getenv("YTDL_POT_PROVIDER_URL", "").strip()
+    if not provider_url:
+        return None
+
+    try:
+        response = requests.get(provider_url.rstrip("/") + "/ping", timeout=5)
+        return {
+            "ok": response.ok,
+            "status": response.status_code,
+        }
+    except Exception as error:
+        return {
+            "ok": False,
+            "error": str(error),
+        }
+
+
 def extract_audio_from_video(input_path: str) -> str:
     ffmpeg = get_ffmpeg_binary()
     if not ffmpeg:
@@ -381,13 +414,16 @@ def debug_payload(input_value: Optional[str] = None):
         "cookieSource": cookie_config_source(),
         "hasPotProviderUrl": bool(os.getenv("YTDL_POT_PROVIDER_URL", "").strip()),
         "hasPotProviderServerHome": bool(os.getenv("YTDL_POT_PROVIDER_SERVER_HOME", "").strip()),
+        "potProvider": pot_provider_status(),
         "hasFfmpeg": get_ffmpeg_binary() is not None,
         "potTrace": is_truthy(os.getenv("YTDL_POT_TRACE", "")),
     }
 
     if input_value:
         try:
-            with YoutubeDL(build_ydl_opts(tempfile.gettempdir(), format_selector="all")) as probe:
+            with YoutubeDL(
+                build_ydl_opts(tempfile.gettempdir(), format_selector="all", log_stage="debug_probe")
+            ) as probe:
                 info = probe.extract_info(input_value, download=False)
             formats = format_summary(info)
             payload["probe"] = {
@@ -438,7 +474,7 @@ def handler():
         )
 
     try:
-        with YoutubeDL(build_ydl_opts(tempfile.gettempdir(), format_selector="all")) as probe:
+        with YoutubeDL(build_ydl_opts(tempfile.gettempdir(), format_selector="all", log_stage="probe")) as probe:
             info = probe.extract_info(input_value, download=False)
     except DownloadError as error:
         log_failure("probe", "unknown", str(error), input=input_value)
@@ -465,6 +501,7 @@ def handler():
         willExtractAudio=formats["audioOnly"] == 0 and formats["muxed"] > 0,
         cookieSource=cookie_config_source(),
         hasFfmpeg=get_ffmpeg_binary() is not None,
+        potProvider=pot_provider_status(),
     )
     if formats["audioOnly"] == 0 and formats["muxed"] == 0:
         log_failure("format_selection", video_id, "no playable formats", formats=formats)
@@ -550,7 +587,9 @@ def handler():
 
         with tempfile.TemporaryDirectory() as temp_dir:
             try:
-                with YoutubeDL(build_ydl_opts(temp_dir, format_selector=selected_format)) as ydl:
+                with YoutubeDL(
+                    build_ydl_opts(temp_dir, format_selector=selected_format, log_stage="download")
+                ) as ydl:
                     ydl.download([input_value])
             except DownloadError as error:
                 log_failure(
