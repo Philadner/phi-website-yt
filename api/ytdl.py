@@ -392,7 +392,7 @@ def handler():
         )
 
     try:
-        with YoutubeDL(build_ydl_opts(tempfile.gettempdir())) as probe:
+        with YoutubeDL(build_ydl_opts(tempfile.gettempdir(), format_selector="all")) as probe:
             info = probe.extract_info(input_value, download=False)
     except DownloadError as error:
         return json_response(
