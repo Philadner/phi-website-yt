@@ -9,7 +9,7 @@ import subprocess
 import tempfile
 import time
 from typing import Optional
-from urllib.parse import parse_qs, quote, urlparse
+from urllib.parse import parse_qs, urlparse
 
 import redis
 import requests
@@ -189,20 +189,24 @@ def upload_to_blob(pathname: str, content_type: str, body: bytes) -> dict:
     if not token:
         raise RuntimeError("BLOB_READ_WRITE_TOKEN missing")
 
-    url = f"https://vercel.com/api/blob/?pathname={quote(pathname, safe='')}"
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "x-vercel-blob-access": "public",
-        "x-add-random-suffix": "0",
-        "x-allow-overwrite": "1",
-        "x-content-type": content_type,
+    from vercel.blob import BlobClient
+
+    with BlobClient(token=token) as client:
+        blob = client.put(
+            pathname,
+            body,
+            access="public",
+            content_type=content_type,
+            add_random_suffix=False,
+            overwrite=True,
+        )
+
+    return {
+        "url": blob.url,
+        "downloadUrl": getattr(blob, "download_url", None) or getattr(blob, "downloadUrl", None) or blob.url,
+        "pathname": blob.pathname,
+        "contentType": getattr(blob, "content_type", None) or getattr(blob, "contentType", None),
     }
-
-    response = requests.put(url, headers=headers, data=body, timeout=120)
-    if not response.ok:
-        raise RuntimeError(f"Blob API request failed ({response.status_code}): {response.text}")
-
-    return response.json()
 
 
 def find_downloaded_file(temp_dir: str, video_id: str) -> Optional[str]:
@@ -415,7 +419,7 @@ def js_runtime_summary(runtimes: Optional[dict] = None) -> dict:
 
 def package_versions() -> dict:
     versions = {}
-    for package in ("yt-dlp", "yt-dlp-ejs", "nodejs-wheel-binaries"):
+    for package in ("yt-dlp", "yt-dlp-ejs", "nodejs-wheel-binaries", "vercel"):
         try:
             versions[package] = importlib.metadata.version(package)
         except importlib.metadata.PackageNotFoundError:
