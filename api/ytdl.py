@@ -367,6 +367,10 @@ def discover_js_runtimes() -> dict:
             return {name.strip(): {"path": path.strip()}}
         return {configured: {}}
 
+    bundled_node = get_bundled_node_binary()
+    if bundled_node:
+        return {"node": {"path": bundled_node}}
+
     for name in ("deno", "node", "bun", "quickjs"):
         path = shutil.which(name)
         if path:
@@ -375,11 +379,30 @@ def discover_js_runtimes() -> dict:
     return {}
 
 
+def get_bundled_node_binary() -> Optional[str]:
+    try:
+        import nodejs_wheel.executable as nodejs_executable
+    except Exception:
+        return None
+
+    binary_name = "node.exe" if os.name == "nt" else "node"
+    bin_dir = (
+        nodejs_executable.ROOT_DIR
+        if os.name == "nt"
+        else os.path.join(nodejs_executable.ROOT_DIR, "bin")
+    )
+    node_path = os.path.join(bin_dir, binary_name)
+    if os.path.exists(node_path):
+        return node_path
+    return None
+
+
 def js_runtime_summary(runtimes: Optional[dict] = None) -> dict:
     values = runtimes if runtimes is not None else discover_js_runtimes()
     return {
         "configured": bool(os.getenv("YTDL_JS_RUNTIME", "").strip()),
         "selected": list(values.keys()),
+        "bundledNode": get_bundled_node_binary() is not None,
         "available": {
             "deno": shutil.which("deno") is not None,
             "node": shutil.which("node") is not None,
