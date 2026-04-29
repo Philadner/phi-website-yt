@@ -253,15 +253,7 @@ def build_ydl_opts(temp_dir: str):
     return opts
 
 
-@app.get("/api/ytdl/debug")
-def debug_handler():
-    configured_secret = os.getenv("YTDL_SECRET", "").strip()
-    if not configured_secret:
-        return json_response(500, {"error": "YTDL_SECRET missing"})
-
-    if extract_secret() != configured_secret:
-        return json_response(401, {"error": "Unauthorised"})
-
+def debug_payload():
     return json_response(
         200,
         {
@@ -287,6 +279,9 @@ def handler():
 
     if extract_secret() != configured_secret:
         return json_response(401, {"error": "Unauthorised"})
+
+    if is_truthy(query_value("debug") or ""):
+        return debug_payload()
 
     input_value = extract_input()
     if not input_value:
