@@ -1,6 +1,7 @@
 import base64
 import binascii
 import glob
+import importlib.metadata
 import json
 import os
 import shutil
@@ -412,6 +413,16 @@ def js_runtime_summary(runtimes: Optional[dict] = None) -> dict:
     }
 
 
+def package_versions() -> dict:
+    versions = {}
+    for package in ("yt-dlp", "yt-dlp-ejs", "nodejs-wheel-binaries"):
+        try:
+            versions[package] = importlib.metadata.version(package)
+        except importlib.metadata.PackageNotFoundError:
+            versions[package] = None
+    return versions
+
+
 def pot_provider_status() -> Optional[dict]:
     provider_url = os.getenv("YTDL_POT_PROVIDER_URL", "").strip()
     if not provider_url:
@@ -474,6 +485,7 @@ def debug_payload(input_value: Optional[str] = None):
         "potProvider": pot_provider_status(),
         "hasFfmpeg": get_ffmpeg_binary() is not None,
         "jsRuntime": js_runtime_summary(),
+        "packages": package_versions(),
         "potTrace": is_truthy(os.getenv("YTDL_POT_TRACE", "")),
     }
 
@@ -561,6 +573,7 @@ def handler():
         hasFfmpeg=get_ffmpeg_binary() is not None,
         potProvider=pot_provider_status(),
         jsRuntime=js_runtime_summary(),
+        packages=package_versions(),
     )
     if formats["audioOnly"] == 0 and formats["muxed"] == 0:
         log_failure("format_selection", video_id, "no playable formats", formats=formats)
