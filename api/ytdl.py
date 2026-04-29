@@ -3,6 +3,8 @@ import binascii
 import glob
 import json
 import os
+import shutil
+import subprocess
 import tempfile
 import time
 from typing import Optional
@@ -223,6 +225,7 @@ def build_cookie_file(temp_dir: str) -> Optional[str]:
     else:
         cookie_contents = raw_cookies
 
+    cookie_contents = normalise_cookie_contents(cookie_contents)
     cookie_path = os.path.join(temp_dir, "youtube-cookies.txt")
     with open(cookie_path, "w", encoding="utf-8") as cookie_handle:
         cookie_handle.write(cookie_contents)
@@ -232,12 +235,23 @@ def build_cookie_file(temp_dir: str) -> Optional[str]:
     return cookie_path
 
 
-def build_ydl_opts(temp_dir: str):
+def normalise_cookie_contents(cookie_contents: str) -> str:
+    lines = []
+    for line in cookie_contents.splitlines():
+        if not line or line.startswith("#"):
+            lines.append(line)
+            continue
+        if len(line.split("\t")) == 7:
+            lines.append(line)
+
+    return "\n".join(lines)
+
+
+def build_ydl_opts(temp_dir: str, *, format_selector: Optional[str] = None):
     opts = {
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
-        "format": "bestaudio/best",
         "outtmpl": os.path.join(temp_dir, "%(id)s.%(ext)s"),
         "cachedir": False,
         "nopart": True,
@@ -246,11 +260,97 @@ def build_ydl_opts(temp_dir: str):
         "extractor_args": build_extractor_args(),
     }
 
+    if format_selector:
+        opts["format"] = format_selector
+
     cookie_file = build_cookie_file(temp_dir)
     if cookie_file:
         opts["cookiefile"] = cookie_file
 
     return opts
+
+
+def format_summary(info: dict) -> dict:
+    formats = info.get("formats") or []
+    downloadable = [item for item in formats if item.get("url")]
+    audio = [
+        item
+        for item in downloadable
+        if item.get("acodec") not in (None, "none") and item.get("vcodec") in (None, "none")
+    ]
+    muxed = [
+        item
+        for item in downloadable
+        if item.get("acodec") not in (None, "none") and item.get("vcodec") not in (None, "none")
+    ]
+
+    return {
+        "total": len(formats),
+        "downloadable": len(downloadable),
+        "audioOnly": len(audio),
+        "muxed": len(muxed),
+        "sample": [
+            {
+                "formatId": item.get("format_id"),
+                "ext": item.get("ext"),
+                "acodec": item.get("acodec"),
+                "vcodec": item.get("vcodec"),
+                "filesize": item.get("filesize") or item.get("filesize_approx"),
+            }
+            for item in (audio or muxed or downloadable)[:5]
+        ],
+    }
+
+
+def audio_format_selector(formats: dict) -> str:
+    if formats["audioOnly"] > 0:
+        return "bestaudio[filesize<30M]/bestaudio[filesize_approx<30M]/bestaudio"
+    return "best[acodec!=none][vcodec!=none][filesize<30M]/best[acodec!=none][vcodec!=none][filesize_approx<30M]/best[acodec!=none][vcodec!=none]"
+
+
+def has_audio_only_format(formats: dict) -> bool:
+    return formats["audioOnly"] > 0
+
+
+def get_ffmpeg_binary() -> Optional[str]:
+    configured = os.getenv("FFMPEG_BINARY", "").strip()
+    if configured:
+        return configured
+    return shutil.which("ffmpeg")
+
+
+def extract_audio_from_video(input_path: str) -> str:
+    ffmpeg = get_ffmpeg_binary()
+    if not ffmpeg:
+        raise RuntimeError("ffmpeg is required to extract audio from muxed video formats")
+
+    extension = os.path.splitext(input_path)[1].lower()
+    if extension == ".webm":
+        output_path = os.path.splitext(input_path)[0] + ".audio.webm"
+    else:
+        output_path = os.path.splitext(input_path)[0] + ".audio.m4a"
+
+    copy_result = subprocess.run(
+        [ffmpeg, "-y", "-i", input_path, "-vn", "-c:a", "copy", output_path],
+        capture_output=True,
+        text=True,
+        timeout=90,
+    )
+    if copy_result.returncode == 0:
+        return output_path
+
+    mp3_path = os.path.splitext(input_path)[0] + ".audio.mp3"
+    transcode_result = subprocess.run(
+        [ffmpeg, "-y", "-i", input_path, "-vn", "-b:a", "128k", mp3_path],
+        capture_output=True,
+        text=True,
+        timeout=90,
+    )
+    if transcode_result.returncode != 0:
+        message = transcode_result.stderr or copy_result.stderr or "ffmpeg audio extraction failed"
+        raise RuntimeError(message[-1000:])
+
+    return mp3_path
 
 
 def debug_payload():
@@ -262,6 +362,7 @@ def debug_payload():
             "cookieSource": cookie_config_source(),
             "hasPotProviderUrl": bool(os.getenv("YTDL_POT_PROVIDER_URL", "").strip()),
             "hasPotProviderServerHome": bool(os.getenv("YTDL_POT_PROVIDER_SERVER_HOME", "").strip()),
+            "hasFfmpeg": get_ffmpeg_binary() is not None,
             "potTrace": is_truthy(os.getenv("YTDL_POT_TRACE", "")),
         },
     )
@@ -304,6 +405,18 @@ def handler():
 
     video_id = extract_video_id(input_value, info)
     video_url = info.get("webpage_url") or info.get("original_url") or input_value
+    formats = format_summary(info)
+    if formats["audioOnly"] == 0 and formats["muxed"] == 0:
+        return json_response(
+            422,
+            {
+                "error": "No playable formats available",
+                "message": "YouTube did not return a downloadable audio-only or muxed audio/video stream for this video.",
+                "videoId": video_id,
+                "videoUrl": video_url,
+                "formats": formats,
+            },
+        )
 
     cached = get_cached_playback(video_id)
     if cached:
@@ -376,7 +489,7 @@ def handler():
 
         with tempfile.TemporaryDirectory() as temp_dir:
             try:
-                with YoutubeDL(build_ydl_opts(temp_dir)) as ydl:
+                with YoutubeDL(build_ydl_opts(temp_dir, format_selector=audio_format_selector(formats))) as ydl:
                     ydl.download([input_value])
             except DownloadError as error:
                 log_failure("stream_download", video_id, str(error))
@@ -387,6 +500,7 @@ def handler():
                         "message": str(error),
                         "videoId": video_id,
                         "videoUrl": video_url,
+                        "formats": formats,
                         "requestId": request_id(),
                     },
                 )
@@ -404,6 +518,23 @@ def handler():
                         "requestId": request_id(),
                     },
                 )
+
+            if not has_audio_only_format(formats):
+                try:
+                    downloaded_path = extract_audio_from_video(downloaded_path)
+                except Exception as error:
+                    log_failure("audio_extract", video_id, str(error))
+                    return json_response(
+                        503,
+                        {
+                            "error": "Audio extraction failed",
+                            "message": str(error),
+                            "videoId": video_id,
+                            "videoUrl": video_url,
+                            "formats": formats,
+                            "requestId": request_id(),
+                        },
+                    )
 
             body_size = os.path.getsize(downloaded_path)
             if body_size > MAX_DOWNLOAD_BYTES:

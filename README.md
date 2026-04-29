@@ -14,6 +14,7 @@ Standalone Vercel Python service for YouTube audio download/upload.
 - `YTDL_COOKIES_B64` (optional; base64-encoded Netscape cookies.txt export for YouTube authentication)
 - `YTDL_COOKIES` (optional; raw Netscape cookies.txt contents, useful for local testing)
 - `YTDL_COOKIE_FILE` (optional; path to a Netscape cookies.txt file, useful for local testing)
+- `FFMPEG_BINARY` (optional; path to `ffmpeg`, used to extract audio if YouTube only returns muxed video)
 
 ## Endpoint
 
