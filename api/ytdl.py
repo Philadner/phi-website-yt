@@ -1,3 +1,5 @@
+import base64
+import binascii
 import glob
 import json
 import os
@@ -90,6 +92,16 @@ def request_id() -> str:
 
 def log_failure(stage: str, video_id: str, error: str) -> None:
     print(f"[ytdl][{request_id()}] {stage} failed for {video_id}: {error}", flush=True)
+
+
+def cookie_config_source() -> Optional[str]:
+    if os.getenv("YTDL_COOKIE_FILE", "").strip():
+        return "file"
+    if os.getenv("YTDL_COOKIES_B64", "").strip():
+        return "base64"
+    if os.getenv("YTDL_COOKIES", "").strip():
+        return "raw"
+    return None
 
 
 def get_redis_connection():
@@ -193,8 +205,35 @@ def build_extractor_args() -> dict:
     return extractor_args
 
 
+def build_cookie_file(temp_dir: str) -> Optional[str]:
+    cookie_file = os.getenv("YTDL_COOKIE_FILE", "").strip()
+    if cookie_file:
+        return cookie_file
+
+    encoded_cookies = os.getenv("YTDL_COOKIES_B64", "").strip()
+    raw_cookies = os.getenv("YTDL_COOKIES", "").strip()
+    if not encoded_cookies and not raw_cookies:
+        return None
+
+    if encoded_cookies:
+        try:
+            cookie_contents = base64.b64decode(encoded_cookies).decode("utf-8")
+        except (binascii.Error, UnicodeDecodeError) as error:
+            raise RuntimeError(f"YTDL_COOKIES_B64 is not valid UTF-8 base64: {error}") from error
+    else:
+        cookie_contents = raw_cookies
+
+    cookie_path = os.path.join(temp_dir, "youtube-cookies.txt")
+    with open(cookie_path, "w", encoding="utf-8") as cookie_handle:
+        cookie_handle.write(cookie_contents)
+        if not cookie_contents.endswith("\n"):
+            cookie_handle.write("\n")
+
+    return cookie_path
+
+
 def build_ydl_opts(temp_dir: str):
-    return {
+    opts = {
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
@@ -206,6 +245,34 @@ def build_ydl_opts(temp_dir: str):
         "extractor_retries": 1,
         "extractor_args": build_extractor_args(),
     }
+
+    cookie_file = build_cookie_file(temp_dir)
+    if cookie_file:
+        opts["cookiefile"] = cookie_file
+
+    return opts
+
+
+@app.get("/api/ytdl/debug")
+def debug_handler():
+    configured_secret = os.getenv("YTDL_SECRET", "").strip()
+    if not configured_secret:
+        return json_response(500, {"error": "YTDL_SECRET missing"})
+
+    if extract_secret() != configured_secret:
+        return json_response(401, {"error": "Unauthorised"})
+
+    return json_response(
+        200,
+        {
+            "ok": True,
+            "hasCookieConfig": cookie_config_source() is not None,
+            "cookieSource": cookie_config_source(),
+            "hasPotProviderUrl": bool(os.getenv("YTDL_POT_PROVIDER_URL", "").strip()),
+            "hasPotProviderServerHome": bool(os.getenv("YTDL_POT_PROVIDER_SERVER_HOME", "").strip()),
+            "potTrace": is_truthy(os.getenv("YTDL_POT_TRACE", "")),
+        },
+    )
 
 
 @app.get("/api/ytdl")
