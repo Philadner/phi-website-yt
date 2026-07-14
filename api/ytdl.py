@@ -792,6 +792,7 @@ def debug_payload(input_value: Optional[str] = None):
 
 
 @app.get("/api/ytdl")
+@app.get("/api/ytdl-stream")
 @app.get("/")
 def handler():
     if request.method != "GET":
@@ -801,7 +802,7 @@ def handler():
     if not configured_secret:
         return json_response(500, {"error": "YTDL_SECRET missing"})
 
-    if is_truthy(query_value("stream") or ""):
+    if request.path == "/api/ytdl-stream" or is_truthy(query_value("stream") or ""):
         return starter_stream_response()
 
     if extract_secret() != configured_secret:

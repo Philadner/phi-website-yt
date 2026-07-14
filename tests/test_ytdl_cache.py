@@ -168,7 +168,7 @@ class YtdlCacheTests(unittest.TestCase):
             ),
         ):
             response = ytdl.app.test_client().get(
-                "/api/ytdl?stream=1&videoId=Tb0MC0jFv6M&expires=123&signature=sig"
+                "/api/ytdl-stream?videoId=Tb0MC0jFv6M&expires=123&signature=sig"
             )
 
         self.assertEqual(response.status_code, 200)
