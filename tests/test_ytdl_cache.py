@@ -90,6 +90,11 @@ class YtdlCacheTests(unittest.TestCase):
         set_cached.assert_called_once_with("Tb0MC0jFv6M", cached)
         youtube_dl.assert_not_called()
 
+    def test_player_client_override_is_scoped_to_youtube(self):
+        args = ytdl.build_extractor_args(["web_creator"])
+
+        self.assertEqual(args["youtube"]["player_client"], ["web_creator"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -297,11 +297,18 @@ def is_truthy(value: str) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
-def build_extractor_args() -> dict:
+def build_extractor_args(player_clients: Optional[list[str]] = None) -> dict:
     extractor_args = {}
+    youtube_args = {}
+
+    if player_clients:
+        youtube_args["player_client"] = player_clients
 
     if is_truthy(os.getenv("YTDL_POT_TRACE", "")):
-        extractor_args["youtube"] = {"pot_trace": ["true"]}
+        youtube_args["pot_trace"] = ["true"]
+
+    if youtube_args:
+        extractor_args["youtube"] = youtube_args
 
     provider_url = os.getenv("YTDL_POT_PROVIDER_URL", "").strip()
     if provider_url:
@@ -354,7 +361,13 @@ def normalise_cookie_contents(cookie_contents: str) -> str:
     return "\n".join(lines)
 
 
-def build_ydl_opts(temp_dir: str, *, format_selector: Optional[str] = None, log_stage: str = "yt_dlp"):
+def build_ydl_opts(
+    temp_dir: str,
+    *,
+    format_selector: Optional[str] = None,
+    log_stage: str = "yt_dlp",
+    player_clients: Optional[list[str]] = None,
+):
     js_runtimes = discover_js_runtimes()
     opts = {
         "quiet": True,
@@ -367,7 +380,7 @@ def build_ydl_opts(temp_dir: str, *, format_selector: Optional[str] = None, log_
         "retries": 1,
         "extractor_retries": 1,
         "source_address": "0.0.0.0",
-        "extractor_args": build_extractor_args(),
+        "extractor_args": build_extractor_args(player_clients),
     }
 
     if js_runtimes:
@@ -417,7 +430,12 @@ def format_summary(info: dict) -> dict:
 
 def audio_format_selector(formats: dict) -> str:
     if formats["audioOnly"] > 0:
-        return "bestaudio[filesize<30M]/bestaudio[filesize_approx<30M]/bestaudio"
+        return (
+            "bestaudio[filesize<30M]/bestaudio[filesize_approx<30M]/bestaudio/"
+            "best[acodec!=none][vcodec!=none][filesize<30M]/"
+            "best[acodec!=none][vcodec!=none][filesize_approx<30M]/"
+            "best[acodec!=none][vcodec!=none]"
+        )
     return "best[acodec!=none][vcodec!=none][filesize<30M]/best[acodec!=none][vcodec!=none][filesize_approx<30M]/best[acodec!=none][vcodec!=none]"
 
 
@@ -706,16 +724,54 @@ def handler():
             )
 
         with tempfile.TemporaryDirectory() as temp_dir:
-            try:
+            downloaded_path = None
+            download_error = None
+            download_attempts = (
+                ("web_creator", ["web_creator"]),
+                ("default", None),
+                ("web_embedded", ["web_embedded"]),
+            )
+
+            for attempt_number, (attempt_name, player_clients) in enumerate(download_attempts, start=1):
+                attempt_dir = os.path.join(temp_dir, f"attempt-{attempt_number}")
+                os.makedirs(attempt_dir, exist_ok=True)
+                log_event(
+                    "stream_download_attempt",
+                    ok=True,
+                    videoId=video_id,
+                    attempt=attempt_name,
+                    selectedFormat=selected_format,
+                )
                 with YoutubeDL(
-                    build_ydl_opts(temp_dir, format_selector=selected_format, log_stage="download")
+                    build_ydl_opts(
+                        attempt_dir,
+                        format_selector=selected_format,
+                        log_stage=f"download_{attempt_name}",
+                        player_clients=player_clients,
+                    )
                 ) as ydl:
-                    ydl.download([input_value])
-            except DownloadError as error:
+                    try:
+                        ydl.download([input_value])
+                    except DownloadError as error:
+                        download_error = error
+                        log_failure(
+                            "stream_download_attempt",
+                            video_id,
+                            str(error),
+                            attempt=attempt_name,
+                            selectedFormat=selected_format,
+                        )
+                        continue
+
+                downloaded_path = find_downloaded_file(attempt_dir, video_id)
+                if downloaded_path:
+                    break
+
+            if not downloaded_path:
                 log_failure(
                     "stream_download",
                     video_id,
-                    str(error),
+                    str(download_error or "downloaded file not found"),
                     formats=formats,
                     selectedFormat=selected_format,
                     willExtractAudio=not has_audio_only_format(formats),
@@ -724,30 +780,10 @@ def handler():
                     503,
                     {
                         "error": "yt-dlp download failed",
-                        "message": str(error),
+                        "message": str(download_error or "Downloaded file not found"),
                         "videoId": video_id,
                         "videoUrl": video_url,
                         "formats": formats,
-                        "requestId": request_id(),
-                    },
-                )
-
-            downloaded_path = find_downloaded_file(temp_dir, video_id)
-            if not downloaded_path:
-                log_failure(
-                    "stream_download",
-                    video_id,
-                    "downloaded file not found",
-                    formats=formats,
-                    selectedFormat=selected_format,
-                )
-                return json_response(
-                    503,
-                    {
-                        "error": "yt-dlp download failed",
-                        "message": "Downloaded file not found",
-                        "videoId": video_id,
-                        "videoUrl": video_url,
                         "requestId": request_id(),
                     },
                 )
