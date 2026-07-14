@@ -492,9 +492,9 @@ def content_type_for_extension(extension: str) -> str:
 
 def open_starter_upstream(input_value: str, video_id: str):
     attempts = (
-        ("web_creator", ["web_creator"]),
-        ("default", None),
         ("web_embedded", ["web_embedded"]),
+        ("default", None),
+        ("web_creator", ["web_creator"]),
     )
     last_error = None
 
