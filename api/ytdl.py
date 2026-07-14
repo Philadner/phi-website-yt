@@ -1,6 +1,8 @@
 import base64
 import binascii
 import glob
+import hashlib
+import hmac
 import importlib.metadata
 import json
 import os
@@ -14,7 +16,7 @@ from urllib.parse import parse_qs, urlparse
 
 import redis
 import requests
-from flask import Flask, jsonify, request
+from flask import Flask, Response, jsonify, redirect, request, stream_with_context
 from yt_dlp import YoutubeDL
 from yt_dlp.utils import DownloadError
 
@@ -22,6 +24,8 @@ from yt_dlp.utils import DownloadError
 LOCK_TTL_SECONDS = 5 * 60
 CACHE_TTL_SECONDS = 30 * 24 * 60 * 60
 MAX_DOWNLOAD_BYTES = 30 * 1024 * 1024
+STARTER_CHUNK_BYTES = 64 * 1024
+STARTER_MAX_FUTURE_SECONDS = 5 * 60
 
 app = Flask(__name__)
 
@@ -50,6 +54,28 @@ def extract_secret() -> str:
     if auth.lower().startswith("bearer "):
         return auth[7:].strip()
     return ""
+
+
+def verify_starter_signature(video_id: str, expires: str, signature: str) -> bool:
+    configured_secret = os.getenv("YTDL_SECRET", "").strip()
+    if not configured_secret or not video_id or not expires or not signature:
+        return False
+
+    try:
+        expires_at = int(expires)
+    except ValueError:
+        return False
+
+    current_time = int(time.time())
+    if expires_at < current_time or expires_at > current_time + STARTER_MAX_FUTURE_SECONDS:
+        return False
+
+    expected = hmac.new(
+        configured_secret.encode("utf-8"),
+        f"{video_id}:{expires_at}".encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    return hmac.compare_digest(expected, signature)
 
 
 def extract_input() -> str:
@@ -428,6 +454,161 @@ def format_summary(info: dict) -> dict:
     }
 
 
+def select_starter_format(info: dict):
+    candidates = []
+    for item in info.get("formats") or []:
+        size = item.get("filesize") or item.get("filesize_approx")
+        protocol = str(item.get("protocol") or "")
+        if not isinstance(size, (int, float)) or size <= 0 or size > MAX_DOWNLOAD_BYTES:
+            continue
+        if not item.get("url") or protocol not in {"http", "https"}:
+            continue
+        if item.get("acodec") in (None, "none") or item.get("vcodec") not in (None, "none"):
+            continue
+        candidates.append(item)
+
+    if not candidates:
+        return None
+
+    return max(
+        candidates,
+        key=lambda item: (
+            float(item.get("abr") or item.get("tbr") or 0),
+            int(item.get("filesize") or 0),
+        ),
+    )
+
+
+def content_type_for_extension(extension: str) -> str:
+    return {
+        "m4a": "audio/mp4",
+        "mp4": "audio/mp4",
+        "webm": "audio/webm",
+        "mp3": "audio/mpeg",
+        "opus": "audio/ogg",
+        "ogg": "audio/ogg",
+    }.get(extension.lower(), "application/octet-stream")
+
+
+def open_starter_upstream(input_value: str, video_id: str):
+    attempts = (
+        ("web_creator", ["web_creator"]),
+        ("default", None),
+        ("web_embedded", ["web_embedded"]),
+    )
+    last_error = None
+
+    for attempt_name, player_clients in attempts:
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                with YoutubeDL(
+                    build_ydl_opts(
+                        temp_dir,
+                        format_selector="all",
+                        log_stage=f"starter_{attempt_name}",
+                        player_clients=player_clients,
+                    )
+                ) as probe:
+                    info = probe.extract_info(input_value, download=False)
+
+            selected = select_starter_format(info)
+            if not selected:
+                raise RuntimeError("No supported audio-only format is available")
+
+            upstream = requests.get(
+                selected["url"],
+                headers=selected.get("http_headers") or {},
+                stream=True,
+                timeout=(5, 30),
+            )
+            upstream.raise_for_status()
+
+            content_length = int(
+                upstream.headers.get("Content-Length") or selected.get("filesize") or 0
+            )
+            if content_length <= 0 or content_length > MAX_DOWNLOAD_BYTES:
+                upstream.close()
+                raise RuntimeError("Starter stream exceeds the service download limit")
+
+            log_event(
+                "starter_open",
+                ok=True,
+                videoId=video_id,
+                attempt=attempt_name,
+                formatId=selected.get("format_id"),
+                bodySize=content_length,
+                extension=selected.get("ext"),
+            )
+            return upstream, selected, content_length
+        except Exception as error:
+            last_error = error
+            log_failure(
+                "starter_open_attempt",
+                video_id,
+                str(error),
+                attempt=attempt_name,
+            )
+
+    raise RuntimeError(str(last_error or "Starter stream unavailable"))
+
+
+def starter_stream_response():
+    video_id = query_value("videoId") or ""
+    expires = query_value("expires") or ""
+    signature = query_value("signature") or ""
+    if not verify_starter_signature(video_id, expires, signature):
+        return json_response(401, {"error": "Invalid or expired starter signature"})
+
+    cached = get_cached_playback(video_id)
+    if not cached:
+        cached = get_blob_playback(video_id)
+        if cached:
+            set_cached_playback(video_id, cached)
+    if cached:
+        return redirect(cached["playback_url"], code=302)
+
+    input_value = f"https://www.youtube.com/watch?v={video_id}"
+    try:
+        upstream, selected, content_length = open_starter_upstream(input_value, video_id)
+    except Exception as error:
+        log_failure("starter_open", video_id, str(error))
+        return json_response(
+            503,
+            {
+                "error": "Starter stream unavailable",
+                "message": str(error),
+                "videoId": video_id,
+                "requestId": request_id(),
+            },
+        )
+
+    def generate():
+        bytes_sent = 0
+        try:
+            for chunk in upstream.iter_content(chunk_size=STARTER_CHUNK_BYTES):
+                if not chunk:
+                    continue
+                bytes_sent += len(chunk)
+                yield chunk
+        except Exception as error:
+            log_failure("starter_stream", video_id, str(error), bytesSent=bytes_sent)
+        finally:
+            upstream.close()
+            log_event("starter_complete", ok=True, videoId=video_id, bytesSent=bytes_sent)
+
+    extension = str(selected.get("ext") or "bin")
+    response = Response(
+        stream_with_context(generate()),
+        status=200,
+        content_type=content_type_for_extension(extension),
+    )
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Content-Length"] = str(content_length)
+    response.headers["Accept-Ranges"] = "none"
+    response.headers["X-Starter-Format"] = str(selected.get("format_id") or "unknown")
+    return response
+
+
 def audio_format_selector(formats: dict) -> str:
     if formats["audioOnly"] > 0:
         return (
@@ -619,6 +800,9 @@ def handler():
     configured_secret = os.getenv("YTDL_SECRET", "").strip()
     if not configured_secret:
         return json_response(500, {"error": "YTDL_SECRET missing"})
+
+    if is_truthy(query_value("stream") or ""):
+        return starter_stream_response()
 
     if extract_secret() != configured_secret:
         return json_response(401, {"error": "Unauthorised"})
@@ -841,14 +1025,7 @@ def handler():
                 )
 
             extension = os.path.splitext(downloaded_path)[1].lstrip(".") or "bin"
-            content_type = {
-                "m4a": "audio/mp4",
-                "mp4": "audio/mp4",
-                "webm": "audio/webm",
-                "mp3": "audio/mpeg",
-                "opus": "audio/ogg",
-                "ogg": "audio/ogg",
-            }.get(extension, "application/octet-stream")
+            content_type = content_type_for_extension(extension)
             blob_path = make_blob_path(video_id, extension)
 
             with open(downloaded_path, "rb") as downloaded_file:

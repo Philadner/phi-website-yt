@@ -22,6 +22,8 @@ Standalone Vercel Python service for YouTube audio download/upload.
 
 - `GET /api/ytdl?videoId=...&secret=...`
 - Also accepts `url`, `arg`, `q`, or `query`
+- `GET /api/ytdl-stream?videoId=...&expires=...&signature=...` streams a
+  short-lived, signed best-quality audio source while the permanent Blob is prepared
 
 ## Response
 

@@ -1,4 +1,7 @@
 import os
+import hashlib
+import hmac
+import time
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -94,6 +97,84 @@ class YtdlCacheTests(unittest.TestCase):
         args = ytdl.build_extractor_args(["web_creator"])
 
         self.assertEqual(args["youtube"]["player_client"], ["web_creator"])
+
+    def test_starter_signature_is_short_lived_and_valid(self):
+        expires = str(int(time.time()) + 60)
+        signature = hmac.new(
+            b"test-secret",
+            f"Tb0MC0jFv6M:{expires}".encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+
+        with patch.dict(os.environ, {"YTDL_SECRET": "test-secret"}, clear=False):
+            self.assertTrue(
+                ytdl.verify_starter_signature("Tb0MC0jFv6M", expires, signature)
+            )
+            self.assertFalse(
+                ytdl.verify_starter_signature("different", expires, signature)
+            )
+
+    def test_starter_format_uses_best_supported_audio(self):
+        selected = ytdl.select_starter_format(
+            {
+                "formats": [
+                    {
+                        "format_id": "251",
+                        "url": "https://media.example/high",
+                        "protocol": "https",
+                        "filesize": 5_100_000,
+                        "abr": 130,
+                        "acodec": "opus",
+                        "vcodec": "none",
+                    },
+                    {
+                        "format_id": "250",
+                        "url": "https://media.example/starter",
+                        "protocol": "https",
+                        "filesize": 2_700_000,
+                        "abr": 70,
+                        "acodec": "opus",
+                        "vcodec": "none",
+                    },
+                    {
+                        "format_id": "249",
+                        "url": "https://media.example/low",
+                        "protocol": "https",
+                        "filesize": 2_000_000,
+                        "abr": 50,
+                        "acodec": "opus",
+                        "vcodec": "none",
+                    },
+                ]
+            }
+        )
+
+        self.assertEqual(selected["format_id"], "251")
+
+    def test_starter_route_streams_selected_audio(self):
+        upstream = MagicMock()
+        upstream.iter_content.return_value = [b"abc", b"def"]
+        selected = {"format_id": "250", "ext": "webm"}
+
+        with (
+            patch.dict(os.environ, {"YTDL_SECRET": "test-secret"}, clear=False),
+            patch.object(ytdl, "verify_starter_signature", return_value=True),
+            patch.object(ytdl, "get_cached_playback", return_value=None),
+            patch.object(ytdl, "get_blob_playback", return_value=None),
+            patch.object(
+                ytdl,
+                "open_starter_upstream",
+                return_value=(upstream, selected, 6),
+            ),
+        ):
+            response = ytdl.app.test_client().get(
+                "/api/ytdl?stream=1&videoId=Tb0MC0jFv6M&expires=123&signature=sig"
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data, b"abcdef")
+        self.assertEqual(response.content_type, "audio/webm")
+        upstream.close.assert_called_once()
 
 
 if __name__ == "__main__":
