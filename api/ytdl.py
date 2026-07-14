@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import tempfile
 import time
+from functools import lru_cache
 from typing import Optional
 from urllib.parse import parse_qs, urlparse
 
@@ -142,11 +143,20 @@ def cookie_config_source() -> Optional[str]:
     return None
 
 
+@lru_cache(maxsize=1)
 def get_redis_connection():
-    redis_url = os.getenv("REDIS_URL", "").strip()
+    redis_url = (
+        os.getenv("UPSTASH_REDIS_KV_REDIS_URL", "").strip()
+        or os.getenv("REDIS_URL", "").strip()
+    )
     if not redis_url:
         return None
-    return redis.from_url(redis_url, decode_responses=True)
+    return redis.from_url(
+        redis_url,
+        decode_responses=True,
+        socket_connect_timeout=2,
+        socket_timeout=2,
+    )
 
 
 def get_cached_playback(video_id: str):
@@ -154,10 +164,14 @@ def get_cached_playback(video_id: str):
     if connection is None:
         return None
 
-    cached = connection.get(cache_key(video_id))
-    if not cached:
+    try:
+        cached = connection.get(cache_key(video_id))
+        if not cached:
+            return None
+        return json.loads(cached)
+    except Exception as error:
+        log_failure("redis_cache_get", video_id, str(error))
         return None
-    return json.loads(cached)
 
 
 def set_cached_playback(video_id: str, value: dict) -> None:
@@ -165,7 +179,10 @@ def set_cached_playback(video_id: str, value: dict) -> None:
     if connection is None:
         return
 
-    connection.setex(cache_key(video_id), CACHE_TTL_SECONDS, json.dumps(value))
+    try:
+        connection.setex(cache_key(video_id), CACHE_TTL_SECONDS, json.dumps(value))
+    except Exception as error:
+        log_failure("redis_cache_set", video_id, str(error))
 
 
 def acquire_lock(video_id: str) -> bool:
@@ -173,7 +190,11 @@ def acquire_lock(video_id: str) -> bool:
     if connection is None:
         return True
 
-    return bool(connection.set(lock_key(video_id), "1", ex=LOCK_TTL_SECONDS, nx=True))
+    try:
+        return bool(connection.set(lock_key(video_id), "1", ex=LOCK_TTL_SECONDS, nx=True))
+    except Exception as error:
+        log_failure("redis_lock_acquire", video_id, str(error))
+        return True
 
 
 def release_lock(video_id: str) -> None:
@@ -181,7 +202,31 @@ def release_lock(video_id: str) -> None:
     if connection is None:
         return
 
-    connection.delete(lock_key(video_id))
+    try:
+        connection.delete(lock_key(video_id))
+    except Exception as error:
+        log_failure("redis_lock_release", video_id, str(error))
+
+
+def cached_playback_response(cached: dict, input_value: str, video_url: str):
+    return json_response(
+        200,
+        {
+            "ok": True,
+            "runtime": "python",
+            "source": "cache",
+            "input": input_value,
+            "videoId": cached["video_id"],
+            "videoUrl": video_url,
+            "blob": {
+                "url": cached["playback_url"],
+                "downloadUrl": cached["playback_url"],
+                "pathname": cached.get("pathname"),
+                "contentType": cached["mime_type"],
+            },
+            "cachedAt": cached["cached_at"],
+        },
+    )
 
 
 def upload_to_blob(pathname: str, content_type: str, body: bytes) -> dict:
@@ -547,6 +592,12 @@ def handler():
             {"error": "One input argument is required via videoId, url, arg, q, or query"},
         )
 
+    requested_video_id = extract_video_id(input_value, {})
+    if requested_video_id != "unknown":
+        cached = get_cached_playback(requested_video_id)
+        if cached:
+            return cached_playback_response(cached, input_value, input_value)
+
     try:
         with YoutubeDL(build_ydl_opts(tempfile.gettempdir(), format_selector="all", log_stage="probe")) as probe:
             info = probe.extract_info(input_value, download=False)
@@ -594,24 +645,7 @@ def handler():
 
     cached = get_cached_playback(video_id)
     if cached:
-        return json_response(
-            200,
-            {
-                "ok": True,
-                "runtime": "python",
-                "source": "cache",
-                "input": input_value,
-                "videoId": cached["video_id"],
-                "videoUrl": video_url,
-                "blob": {
-                    "url": cached["playback_url"],
-                    "downloadUrl": cached["playback_url"],
-                    "pathname": cached.get("pathname"),
-                    "contentType": cached["mime_type"],
-                },
-                "cachedAt": cached["cached_at"],
-            },
-        )
+        return cached_playback_response(cached, input_value, video_url)
 
     if not acquire_lock(video_id):
         return json_response(
@@ -627,24 +661,7 @@ def handler():
     try:
         cached = get_cached_playback(video_id)
         if cached:
-            return json_response(
-                200,
-                {
-                    "ok": True,
-                    "runtime": "python",
-                    "source": "cache",
-                    "input": input_value,
-                    "videoId": cached["video_id"],
-                    "videoUrl": video_url,
-                    "blob": {
-                        "url": cached["playback_url"],
-                        "downloadUrl": cached["playback_url"],
-                        "pathname": cached.get("pathname"),
-                        "contentType": cached["mime_type"],
-                    },
-                    "cachedAt": cached["cached_at"],
-                },
-            )
+            return cached_playback_response(cached, input_value, video_url)
 
         declared_size = info.get("filesize") or info.get("filesize_approx")
         if isinstance(declared_size, int) and declared_size > MAX_DOWNLOAD_BYTES:

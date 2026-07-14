@@ -6,7 +6,8 @@ Standalone Vercel Python service for YouTube audio download/upload.
 
 - `YTDL_SECRET`
 - `BLOB_READ_WRITE_TOKEN`
-- `REDIS_URL`
+- `UPSTASH_REDIS_KV_REDIS_URL` (preferred; injected by the Vercel Upstash integration)
+- `REDIS_URL` (legacy fallback)
 - `CRON_SECRET` (recommended; Vercel will send it as a Bearer token for cron requests)
 - `YTDL_POT_PROVIDER_URL` (optional; external bgutil provider base URL such as `http://your-provider:4416`)
 - `YTDL_POT_PROVIDER_SERVER_HOME` (optional; local bgutil server path for script mode)
