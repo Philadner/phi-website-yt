@@ -27,6 +27,9 @@ Standalone Vercel Python service for YouTube audio download/upload.
 
 Returns JSON with the uploaded Blob URL plus basic metadata.
 
+Existing `audio/<videoId>.*` blobs are used to rebuild missing Redis cache entries,
+so replacing the Redis database does not require downloading every track again.
+
 ## Runtime
 
 - `api/ytdl.py` runs on Vercel Python

@@ -229,6 +229,33 @@ def cached_playback_response(cached: dict, input_value: str, video_url: str):
     )
 
 
+def get_blob_playback(video_id: str):
+    token = os.getenv("BLOB_READ_WRITE_TOKEN", "").strip()
+    if not token:
+        return None
+
+    try:
+        from vercel.blob import BlobClient
+
+        with BlobClient(token=token) as client:
+            result = client.list_objects(prefix=f"audio/{video_id}.", limit=1)
+            if not result.blobs:
+                return None
+
+            blob = result.blobs[0]
+            details = client.head(blob.url)
+            return {
+                "video_id": video_id,
+                "playback_url": blob.url,
+                "pathname": blob.pathname,
+                "mime_type": details.content_type or "audio/mpeg",
+                "cached_at": str(int(blob.uploaded_at.timestamp())),
+            }
+    except Exception as error:
+        log_failure("blob_cache_lookup", video_id, str(error))
+        return None
+
+
 def upload_to_blob(pathname: str, content_type: str, body: bytes) -> dict:
     token = os.getenv("BLOB_READ_WRITE_TOKEN", "").strip()
     if not token:
@@ -271,15 +298,10 @@ def is_truthy(value: str) -> bool:
 
 
 def build_extractor_args() -> dict:
-    extractor_args = {
-        "youtube": {
-            "player_client": ["default", "mweb"],
-            "fetch_pot": ["auto"],
-        }
-    }
+    extractor_args = {}
 
     if is_truthy(os.getenv("YTDL_POT_TRACE", "")):
-        extractor_args["youtube"]["pot_trace"] = ["true"]
+        extractor_args["youtube"] = {"pot_trace": ["true"]}
 
     provider_url = os.getenv("YTDL_POT_PROVIDER_URL", "").strip()
     if provider_url:
@@ -344,6 +366,7 @@ def build_ydl_opts(temp_dir: str, *, format_selector: Optional[str] = None, log_
         "nopart": True,
         "retries": 1,
         "extractor_retries": 1,
+        "source_address": "0.0.0.0",
         "extractor_args": build_extractor_args(),
     }
 
@@ -595,6 +618,10 @@ def handler():
     requested_video_id = extract_video_id(input_value, {})
     if requested_video_id != "unknown":
         cached = get_cached_playback(requested_video_id)
+        if not cached:
+            cached = get_blob_playback(requested_video_id)
+            if cached:
+                set_cached_playback(requested_video_id, cached)
         if cached:
             return cached_playback_response(cached, input_value, input_value)
 

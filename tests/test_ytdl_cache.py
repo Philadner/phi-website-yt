@@ -65,6 +65,31 @@ class YtdlCacheTests(unittest.TestCase):
         self.assertEqual(response.get_json()["source"], "cache")
         youtube_dl.assert_not_called()
 
+    def test_existing_blob_rebuilds_missing_redis_entry(self):
+        cached = {
+            "video_id": "Tb0MC0jFv6M",
+            "playback_url": "https://blob.example/teardrop.webm",
+            "pathname": "audio/Tb0MC0jFv6M.webm",
+            "mime_type": "audio/webm",
+            "cached_at": "1234",
+        }
+
+        with (
+            patch.dict(os.environ, {"YTDL_SECRET": "test-secret"}, clear=False),
+            patch.object(ytdl, "get_cached_playback", return_value=None),
+            patch.object(ytdl, "get_blob_playback", return_value=cached),
+            patch.object(ytdl, "set_cached_playback") as set_cached,
+            patch.object(ytdl, "YoutubeDL") as youtube_dl,
+        ):
+            response = ytdl.app.test_client().get(
+                "/api/ytdl?videoId=Tb0MC0jFv6M&secret=test-secret"
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["source"], "cache")
+        set_cached.assert_called_once_with("Tb0MC0jFv6M", cached)
+        youtube_dl.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()
